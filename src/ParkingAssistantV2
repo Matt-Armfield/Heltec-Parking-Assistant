@@ -1,0 +1,1708 @@
+/*
+ * ESPx Parking Assistant
+ * Includes captive portal and OTA Updates
+ * This provides code for an ESP32 Heltec V3 controller for WS2812b 8x32 LED matrix panel
+ * Last Updated: 7/21/2025
+ * Based off the original ResinChem Tech (https://github.com/Resinchem/ESP-Parking-Assistant)- Released under GNU General Public License v3.0.  There is no guarantee or warranty, either expressed or implied, as to the
+ * suitability or utilization of this project, or as to the condition of this project, or whether it will be suitable to the users purposes or needs.
+ * Use is solely at the end user's risk.
+ * This was adapted for my wants for a larger panel for potential graphics and arrows for guiding the car into the garage correctly.
+ */
+#pragma once
+
+// =================================================================
+// LIBRARIES
+// =================================================================
+#include <Wire.h>                // For I2C communication (OLED, VL53L0X)
+#include <LittleFS.h>            // For file system operations (config storage)
+#include <TFMPlus.h>             // TF-Mini Plus LiDAR library ([https://github.com/budryerson/TFMini-Plus](https://github.com/budryerson/TFMini-Plus))
+#include <WiFiClient.h>          // Arduino ESP Core - creates a client that can connect to an IP address
+#include <PubSubClient.h>        // Provides MQTT functions ([https://github.com/knolleary/pubsubclient](https://github.com/knolleary/pubsubclient))
+#include <ArduinoOTA.h>          // Arduino OTA updates ([https://github.com/jandrassy/ArduinoOTA](https://github.com/jandrassy/ArduinoOTA))
+#include <ArduinoJson.h>         // JSON parsing for config file ([https://github.com/bblanchon/ArduinoJson](https://github.com/bblanchon/ArduinoJson))
+#include <math.h>                // For mathematical operations
+#include <WiFi.h>                // Standard WiFi connectivity for ESP32
+#include <ESPmDNS.h>             // mDNS for network discovery
+#include <WebServer.h>           // Web server functionalities (handles HTTP requests, OTA updates)
+#include <Update.h>              // For OTA update handling
+#include <VL53L0X.h>             // VL53L0X ToF Sensor library ([https://github.com/pololu/vl53l0x-arduino](https://github.com/pololu/vl53l0x-arduino))
+#include <Adafruit_NeoPixel.h>   // For WS2812 LED control (required by NeoMatrix)
+#include <Adafruit_GFX.h>        // Core graphics library (required by NeoMatrix)
+#include <Adafruit_NeoMatrix.h>  // For WS2812 LED matrix control
+#include <U8g2lib.h>             // For Heltec V3 OLED display ([https://github.com/olikraus/u8g2](https://github.com/olikraus/u8g2))
+#include "html.h"                //html code for the firmware update page
+
+// =================================================================
+// TFMPlus Library Constants (Explicitly Defined for Compilation)
+// These are typically defined in TFMPlus.h, but are added here to
+// resolve "not declared in this scope" errors that can occur
+// depending on the compiler setup or library version.
+// =================================================================
+#define SET_BAUD_RATE         0x06  // Command to set the baud rate
+#define BAUD_115200           0x08  // Baud rate value for 115200
+#define SET_MEASURE_MODE      0x00  // Command to set the measurement mode
+#define MEASURE_MODE_STANDARD 0x01  // Standard measurement mode
+#define SET_FRAME_RATE        0x03  // Command to set the frame rate
+#define FRAME_RATE_250        0x01  // Frame rate value for 250Hz
+#define SOFT_RESET            0x02  // Command for software reset
+
+// =================================================================
+// HARDWARE PIN DEFINITIONS (Adjusted for Heltec WiFi Kit 32 V3)
+// =================================================================
+#define VERSION "v0.52 (Heltec V3)" // Custom version for Heltec V3
+
+// LED Matrix Panel (WS2812 8x32)
+#define LED_DATA_PIN        19      // GPIO pin connected to LED matrix DIN (common for ESP32)
+#define MATRIX_WIDTH        32      // Width of the LED matrix
+#define MATRIX_HEIGHT       8       // Height of the LED matrix
+#define NUM_LEDS_TOTAL      (MATRIX_WIDTH * MATRIX_HEIGHT) // Total number of LEDs (32 * 8 = 256)
+
+// TF-Mini Plus LiDAR Sensor (UART)
+#define ESP32_RX_PIN        16      // TF-Mini TX connects to ESP32 RX2
+#define ESP32_TX_PIN        17      // TF-Mini RX connects to ESP32 TX2
+
+// VL53L0X Side Sensor (I2C)
+// VL53L0X uses default I2C pins (SDA=21, SCL=22 on most ESP32 boards, but can be configured)
+// For Heltec V3, default I2C for external sensors are often 21/22 or 18/19.
+// Assuming it's connected to standard I2C bus 0 (SDA 21, SCL 22) for VL53L0X.
+
+// Heltec V3 Built-in OLED (I2C)
+#define OLED_SDA            4       // Heltec V3 OLED SDA pin
+#define OLED_SCL            5       // Heltec V3 OLED SCL pin
+#define OLED_RST            -1      // Heltec V3 OLED reset pin (not used by U8g2 for built-in)
+#define ONBOARD_LED         35      // Heltec V3 green onboard LED (GPIO 35)
+
+// ================================
+//  User Defined values and options
+// ================================
+#define APPNAME "Parking Assistant"
+//  Change default values here. Changing any of these requires a recompile and upload.
+#define WIFIMODE 2                  // 0 = Only Soft Access Point, 1 = Only connect to local WiFi network with UN/PW, 2 = Both
+#define MQTTMODE 1                  // 0 = Disable MQTT, 1 = Enable (will only be enabled if WiFi mode = 1 or 2 - broker must be on same network)
+#define SERIAL_DEBUG 1              // 0 = Disable, 1 = enable (recommended for debugging)
+#define MILLI_AMPS 5000;            // Default - will be defined during onboarding
+#define FORMAT_LITTLEFS_IF_FAILED true // DO NOT CHANGE!!!
+
+// Arduino IDE OTA Updates
+bool ota_flag = true;               // Must leave this as true for board to broadcast port to IDE upon boot
+uint16_t ota_boot_time_window = 2500; // minimum time on boot for IP address to show in IDE ports, in millisecs
+uint16_t ota_time_window = 20000;   // time to start file upload when ota_flag set to true (after initial boot), in millsecs
+uint16_t ota_time_elapsed = 0;      // Counter when OTA active
+uint16_t ota_time = ota_boot_time_window;
+uint8_t web_otaDone = 0;            // Web OTA Firmware Update
+
+//==========================
+// LED Setup & Portal Options
+//==========================
+// Defaults values - these will be set/overwritten by portal or last saved vals on reboot
+int numLEDs = NUM_LEDS_TOTAL; // Fixed to 8x32 matrix size
+int milliamps = MILLI_AMPS;
+byte activeBrightness = 100;
+byte sleepBrightness = 5;
+bool rightLEDWiring = false; // For matrix, this might represent horizontal/vertical layout or direction
+uint32_t maxOperationTimePark = 60;
+uint32_t maxOperationTimeExit = 5;
+String ledEffect_m1 = "Out-In"; // Effects will be adapted for matrix
+bool showStandbyLEDs = true;
+String deviceName = "parkasst";
+
+//WiFi Info
+String wifiHostName = deviceName;
+String otaHostName = deviceName + "_OTA";
+
+String wifiSSID = "";
+String wifiPW = "";
+
+// Colors for Adafruit_NeoMatrix (uint32_t)
+uint32_t ledColorOn_m1;
+uint32_t ledColorOff;
+uint32_t ledColorStandby;
+uint32_t ledColorWake;
+uint32_t ledColorActive;
+uint32_t ledColorParked;
+uint32_t ledColorBackup;
+
+//Needed for web dropdowns (indices into ColorCodes array)
+byte webColorStandby = 3;  //Blue
+byte webColorWake = 2;     //Green
+byte webColorActive = 1;   //Yellow
+byte webColorParked = 0;   //Red
+byte webColorBackup = 0;   //Red
+
+//Initial distances for default load (only used for initial onboarding)
+byte uomDistance = 0;      // 0=inches, 1=centimeters
+int wakeDistance = 3048;   // wake/sleep distance (~10ft)
+int startDistance = 1829;  // Start countdown distance (~6')
+int parkDistance = 610;    // Final parked distacce (~2')
+int backupDistance = 457;  // Flash backup distance (~18")
+
+//Side sensor (VL53L0X on ESP32)
+bool useSideSensor = false;
+int leftDistance = 610;    // 610 = ~24 in
+int rightDistance = 508;   // 508 = ~20 in
+byte sideSensorPos = 0;    // 0=unused, 1=right side, 2=left side
+
+//No Car Debounce Setting (helps prevent false activations due to signal noise)
+byte nocarDetectedCounterMax = 10;    //noCarDebounce (valid values 0 - 25)
+
+// ===============================
+//  MQTT Variables
+// ===============================
+//  MQTT will only be used if a server address other than '0.0.0.0' is entered via portal
+byte mqttAddr_1 = 0;
+byte mqttAddr_2 = 0;
+byte mqttAddr_3 = 0;
+byte mqttAddr_4 = 0;
+int mqttPort = 0;
+String mqttClient = "parkasst";
+String mqttUser = "myusername";
+String mqttPW = "mypassword";
+uint16_t mqttTelePeriod = 60;
+uint32_t mqttLastUpdate = 0;
+String mqttTopicSub ="parkasst";  //v0.41 (for now, will always be same as pub)
+String mqttTopicPub = "parkasst"; //v0.41
+
+bool mqttEnabled = false;         //Will be enabled/disabled depending on whether a valid IP address is defined in Settings (0.0.0.0 disables MQTT)
+bool mqttConnected = false;       //Will be enabled if defined and successful connnection made.  This var should be checked upon any MQTT action.
+bool prevCarStatus = false;       //v0.44 for forcing MQTT update on state change
+bool forceMQTTUpdate = false;     //v0.44 for forcing MQTT update on state change
+
+//Variables for WiFi and creating unique entity IDs and topics (HA discovery)
+byte macAddr[6];                  //Device MAC address (array is in reverse order)
+String strMacAddr;                //MAC address as string and in proper order
+char uidPrefix[] = "prkast";      //Prefix for unique ID generation
+char devUniqueID[30];             //Generated Unique ID for this device (uidPrefix + last 6 MAC characters)
+
+// ===============================
+//  Effects and Color arrays
+// ===============================
+//  Effects are defined in defineEffects() - called in Setup
+//  Effects must be handled in the lights on call
+//  To add an effect:
+//    - Increase array below (if adding)
+//    - Add element and add name in defineEffects()
+//    - Update if statement in main loop
+//    - Add update function to implement effect (called by main loop)
+int numberOfEffects = 5;
+String Effects[5];
+
+// To add a color:
+//    - Increase array size above if adding new
+//    - Add elements and value in defineColors()
+int numberOfColors = 10;
+uint32_t ColorCodes[10]; // Changed to uint32_t for Adafruit_NeoMatrix
+String WebColors[10];
+// -------------------------------
+
+//OTHER GLOBAL VARIABLES
+bool onboarding = false;          //Will be set to true if no config file or wifi cannot be joined
+bool tfMiniEnabled = false;
+bool blinkOn = false;
+bool blinkSideOn = false;
+int intervalDistance = 0;
+bool carDetected = false;
+bool isAwake = false;
+bool coldStart = true;
+
+// Global variables to store TF-Mini data for display functions
+int16_t currentFlux = 0;
+int16_t currentTemp = 0;
+
+byte carDetectedCounter = 0;
+byte carDetectedCounterMax = 3;
+byte nocarDetectedCounter = 0;
+byte outOfRangeCounter = 0;
+uint32_t startTime;
+bool exitSleepTimerStarted = false;
+bool parkSleepTimerStarted = false;
+
+String baseIP;
+//---------------------------
+// Instantiate objects
+//---------------------------
+
+WiFiClient espClient;
+WebServer server(80); // For ESP32
+PubSubClient client(espClient); // MQTT client
+
+TFMPlus tfmini; // TF-Mini Plus LiDAR object
+
+// Adafruit NeoMatrix for 8x32 LED panel
+// NEO_MATRIX_TOP + NEO_MATRIX_LEFT + NEO_MATRIX_COLUMNS + NEO_MATRIX_ZIGZAG is a common layout for 8x32
+// You may need to adjust the flags based on your specific matrix panel's wiring.
+Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(MATRIX_WIDTH, MATRIX_HEIGHT, LED_DATA_PIN,
+  NEO_MATRIX_TOP + NEO_MATRIX_LEFT + NEO_MATRIX_COLUMNS + NEO_MATRIX_ZIGZAG,
+  NEO_GRB + NEO_KHZ800);
+
+// Heltec V3 OLED display (SSD1306, 128x64)
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, OLED_RST, OLED_SCL, OLED_SDA); // R0 rotation, -1 for reset, SCL, SDA
+
+VL53L0X side_sensor; // VL53L0X ToF sensor object
+
+//---- Captive Portal -------
+//flag for saving data in captive portal
+bool shouldSaveConfig = false;
+
+//callback notifying us of the need to save config
+void saveConfigCallback () {
+  shouldSaveConfig = true;
+}
+//---------------------------
+
+// ==============================
+//  Define Effects
+// ==============================
+//  Increase array size above if adding new
+//  Effect name must not exceed 15 characters and must be a String
+void defineEffects() {
+  Effects[0] = "Out-In";
+  Effects[1] = "In-Out";
+  Effects[2] = "Full-Strip";
+  Effects[3] = "Full-Strip-Inv";
+  Effects[4] = "Solid";
+}
+
+// ==============================
+//  Define Colors
+// ==============================
+//  Increase array size above if adding new
+//  Color must be defined as a CRGB::Named Color
+void defineColors() {
+    // Colors defined using matrix.Color(R, G, B) for Adafruit_NeoMatrix
+    ColorCodes[0] = matrix.Color(255, 0, 0);    // Red
+    ColorCodes[1] = matrix.Color(255, 255, 0);  // Yellow
+    ColorCodes[2] = matrix.Color(0, 255, 0);    // Green
+    ColorCodes[3] = matrix.Color(0, 0, 255);    // Blue
+    ColorCodes[4] = matrix.Color(255, 255, 255); // White
+    ColorCodes[5] = matrix.Color(255, 105, 180); // HotPink
+    ColorCodes[6] = matrix.Color(255, 165, 0);  // Orange
+    ColorCodes[7] = matrix.Color(0, 255, 0);    // Lime (same as Green, adjust if needed)
+    ColorCodes[8] = matrix.Color(0, 255, 255);  // Cyan
+    ColorCodes[9] = matrix.Color(128, 128, 128); // Gray
+
+    WebColors[0] = "Red";
+    WebColors[1] = "Yellow";
+    WebColors[2] = "Green";
+    WebColors[3] = "Blue";
+    WebColors[4] = "White";
+    WebColors[5] = "Pink";
+    WebColors[6] = "Orange";
+    WebColors[7] = "Lime";
+    WebColors[8] = "Cyan";
+    WebColors[9] = "Gray";
+}
+
+//=======================================
+// Read config file from flash (LittleFS)
+//=======================================
+void readConfigFile() {
+  if (LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED)) {
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.println("mounted file system");
+    #endif
+    if (LittleFS.exists("/config.json")) {
+      //file exists, reading and loading
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+            Serial.println("reading config file");
+      #endif
+      File configFile = LittleFS.open("/config.json", "r");
+      if (configFile) {
+        #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+                Serial.println("opened config file");
+        #endif
+        size_t size = configFile.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+        DynamicJsonDocument json(1024);
+        auto deserializeError = deserializeJson(json, buf.get());
+        serializeJson(json, Serial);
+        if (!deserializeError) {
+
+          #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+            Serial.println("\nparsed json");
+          #endif
+          // Read values here from LittleFS (use defaults for all values in case they don't exist to avoid potential boot loop)
+          //DON'T NEED TO STORE OR RECALL WIFI INFO - Written to flash automatically by library when successful connection.
+          deviceName = json["device_name"] | "ParkingAsst";
+          numLEDs = json["led_count"] | NUM_LEDS_TOTAL; // Ensure it defaults to total matrix LEDs
+          rightLEDWiring = json["right_led_wiring"]|0;
+          maxOperationTimePark = json["led_park_time"]|60;
+          maxOperationTimeExit = json["led_exit_time"]|5;
+          activeBrightness = json["led_brightness_active"]|100;
+          sleepBrightness = json["led_brightness_sleep"]|5;
+          uomDistance = json["uom_distance"]|0;
+          wakeDistance = 3048;
+          startDistance = 1829;
+          parkDistance = 610;
+          backupDistance = 457;
+          useSideSensor = json["use_side_sensor"]|0;
+          leftDistance = json["left_distance"]|0;
+          rightDistance = json["right_distance"]|0;
+          sideSensorPos = json["side_sensor_pos"]|0;
+          nocarDetectedCounterMax = json["no_car_debounce"]|10;
+          webColorStandby = json["color_standby"]|3;
+          webColorWake = json["color_wake"]|2;
+          webColorActive = json["color_active"]|1;
+          webColorParked = json["color_parked"]|0;
+          webColorBackup = json["color_backup"]|0;
+          ledColorStandby = ColorCodes[webColorStandby];
+          ledColorWake = ColorCodes[webColorWake];
+          ledColorActive = ColorCodes[webColorActive];
+          ledColorParked = ColorCodes[webColorParked];
+          ledColorBackup = ColorCodes[webColorBackup];
+          ledEffect_m1 = json["led_effect"]|"Out-In";
+          mqttAddr_1 = json["mqtt_addr_1"]|0;
+          mqttAddr_2 = json["mqtt_addr_2"]|0;
+          mqttAddr_3 = json["mqtt_addr_3"]|0;
+          mqttAddr_4 = json["mqtt_addr_4"]|0;
+          //Disable MQTT if IP = 0.0.0.0
+          if ((mqttAddr_1 == 0) && (mqttAddr_2 == 0) && (mqttAddr_3 == 0) && (mqttAddr_4 == 0)) {
+            mqttPort = 0;
+            mqttEnabled = false;
+            mqttConnected = false;
+          } else {
+            mqttPort = json["mqtt_port"]|0;
+            mqttTelePeriod = json["mqtt_tele_period"]|60;
+            mqttUser = json["mqtt_user"]|"mqttuser";
+            mqttPW = json["mqtt_pw"]|"mqttpwd";
+            mqttTopicSub = json["mqtt_topic_sub"]|"parkasst";
+            mqttTopicPub = json["mqtt_topic_pub"]|"parkasst";
+            mqttEnabled = true;
+          }
+          //=== Set or calculate other globals =====
+          wifiHostName = deviceName;
+          mqttClient = deviceName;
+          otaHostName = deviceName + "_OTA";
+
+        } else {
+          #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+            Serial.println("failed to load json config");
+          #endif
+          onboarding = true;
+        }
+        configFile.close();
+      } else {
+        onboarding = true;
+      }
+    } else {
+      onboarding = true;
+    }
+    LittleFS.end();
+  } else {
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println("failed to mount FS");
+    #endif
+    onboarding = true;
+  }
+}
+
+//======================================
+// Write config file to flash (LittleFS)
+//======================================
+void writeConfigFile(bool restart_ESP) {
+  // Writes new settings to LittleFS (new boot defaults)
+  if (LittleFS.begin()) {
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println("Attempting to update boot settings");
+    #endif
+    DynamicJsonDocument json(1024);
+    json.clear();
+
+    json["device_name"] = deviceName;
+    json["led_count"] = numLEDs;
+    if (rightLEDWiring) {
+      json["right_led_wiring"] = 1;
+    } else {
+      json["right_led_wiring"] = 0;
+    }
+    json["led_brightness_active"] = activeBrightness;
+    json["led_brightness_sleep"] = sleepBrightness;
+    json["led_park_time"] = maxOperationTimePark;
+    json["led_exit_time"] = maxOperationTimeExit;
+    json["uom_distance"] = uomDistance;
+    json["wake_mils"] = wakeDistance;
+    json["start_mils"] = startDistance;
+    json["park_mils"] = parkDistance;
+    json["backup_mils"] = backupDistance;
+    json["use_side_sensor"] = (useSideSensor ? 1 : 0); // Simplified boolean to int
+    json["left_distance"] = leftDistance;
+    json["right_distance"] = rightDistance;
+    json["side_sensor_pos"] = sideSensorPos;
+    json["no_car_debounce"] = nocarDetectedCounterMax;
+    json["color_standby"] = webColorStandby;
+    json["color_wake"] = webColorWake;
+    json["color_active"] = webColorActive;
+    json["color_parked"] = webColorParked;
+    json["color_backup"] = webColorBackup;
+    json["led_effect"] = ledEffect_m1;
+    json["mqtt_addr_1"] = mqttAddr_1;
+    json["mqtt_addr_2"] = mqttAddr_2;
+    json["mqtt_addr_3"] = mqttAddr_3;
+    json["mqtt_addr_4"] = mqttAddr_4;
+    json["mqtt_port"] = mqttPort;
+    json["mqtt_tele_period"] = mqttTelePeriod;
+    json["mqtt_user"] = mqttUser;
+    json["mqtt_pw"] = mqttPW;
+    json["mqtt_topic_sub"] = mqttTopicSub;
+    json["mqtt_topic_pub"] = mqttTopicPub;
+
+    File configFile = LittleFS.open("/config.json", "w");
+    if (!configFile) {
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.println("failed to open config file for writing");
+      #endif
+      configFile.close();
+      return;
+    } else {
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        serializeJson(json, Serial);
+      #endif
+      serializeJson(json, configFile);
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.println("Settings saved.");
+      #endif
+      configFile.close();
+      LittleFS.end();
+      if (restart_ESP) {
+        ESP.restart();
+      }
+    }
+  } else {
+//could not mount filesystem
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println("failed to mount FS");
+    #endif
+  }
+}
+
+//===============================
+// Web pages and handlers
+//===============================
+// Main Settings page
+// Root / Main Settings page handler
+void handleRoot() {
+  //Convert mm back to inches and round to nearest integer
+  uint16_t intWakeDistance = round(wakeDistance / 25.4);
+  uint16_t intStartDistance = round(startDistance / 25.4);
+  uint16_t intParkDistance = round(parkDistance / 25.4);
+  uint16_t intBackupDistance = round(backupDistance / 25.4);
+  uint16_t intLeftDistance = round(leftDistance / 25.4);
+  uint16_t intRightDistance = round(rightDistance / 25.4);
+
+  //If using millimeters
+  if (uomDistance) {
+    intWakeDistance = wakeDistance;
+    intStartDistance = startDistance;
+    intParkDistance = parkDistance;
+    intBackupDistance = backupDistance;
+    intLeftDistance = leftDistance;
+    intRightDistance = rightDistance;
+  }
+
+  String mainPage = "<html><head>";
+  mainPage += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">";
+  if (onboarding) {
+    //Onboarding/Mobile Page
+    mainPage += "<title>VAR_APP_NAME Onboarding</title>\
+    <style>\
+      body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000000; }\
+    </style>\
+    </head>\
+    <body>";
+    mainPage += "<h1>VAR_APP_NAME Onboarding</h1>";
+    mainPage += "Please enter your WiFi information below. These are CASE-SENSITIVE and limited to 64 characters each.<br><br>";
+    mainPage += "<form method=\"post\" enctype=\"application/x-www-form-urlencoded\" action=\"/onboard\">\
+      <table>\
+      <tr>\
+      <td><label for=\"ssid\">SSID:</label></td>\
+      <td><input type=\"text\" name=\"ssid\" maxlength=\"64\" value=\"";
+    mainPage += wifiSSID;
+    mainPage += "\"></td></tr>\
+        <tr>\
+        <td><label for=\"wifipw\">Password:</label></td>\
+        <td><input type=\"password\" name=\"wifipw\" maxlength=\"64\" value=\"";
+    mainPage += wifiPW;
+    mainPage += "\"></td></tr></table><br>";
+    mainPage += "<b>Device Name: </b>Please give this device a unique name from all other devices on your network, including other installs of VAR_APP_NAME. ";
+    mainPage += "This will be used to set the WiFi and OTA hostnames.<br><br>";
+    mainPage += "16 alphanumeric (a-z, A-Z, 0-9) characters max, no spaces:";
+    mainPage += "<table>\
+        <tr>\
+        <td><label for=\"devicename\">Device Name:</label></td>\
+        <td><input type=\"text\" name=\"devicename\" maxlength=\"16\" value=\"";
+    mainPage += deviceName;
+    mainPage += "\"></td></tr>";
+    mainPage += "</table><br><br>";
+    mainPage += "<b>Max Milliamps: </b>Enter the max current the LEDs are allowed to draw.  This should be about 80% of the rated peak max of the power supply. ";
+    mainPage += "Valid values are 2000 to 10000.  See documentation for more info.<br><br>";
+    mainPage += "<table>\
+        <tr>\
+        <td><label for=\"maxmilliamps\">Max Milliamps:</label></td>\
+        <td><input type=\"number\" min=\"2000\" max=\"10000\" step=\"1\" value=\"";
+    mainPage += String(milliamps);
+    mainPage += "\"></td></tr>";
+    mainPage += "</table><br><br>";
+    mainPage += "<input type=\"submit\" value=\"Submit\">";
+    mainPage += "</form>";
+  } else {
+    //Normal Settings Page
+    mainPage += "<title>VAR_DEVICE_NAME - Main</title>\
+      <style>\
+        body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
+      </style>\
+    </head>\
+    <body>\
+      <h1>Controller Settings (VAR_DEVICE_NAME)</h1>";
+    mainPage += "Firmware Version: VAR_CURRENT_VER<br><br>";
+    mainPage += "<table border=\"1\" >";
+    mainPage += "<tr><td>Device Name:</td><td>" + deviceName + "</td</tr>";
+    mainPage += "<tr><td>WiFi Network:</td><td>" + WiFi.SSID() + "</td</tr>";
+    mainPage += "<tr><td>MAC Address:</td><td>" + strMacAddr + "</td</tr>";
+    mainPage += "<tr><td>IP Address:</td><td>" + baseIP + "</td</tr>";
+    mainPage += "<tr><td>Max Milliamps:</td><td>" + String(milliamps) + "</td></tr>";
+    mainPage += "</table><br>";
+
+    mainPage += "Changes made here will be used <b><i>until the controller is restarted</i></b>, unless the box to save the settings as new boot defaults is checked.<br>\
+      <ul>\
+        <li>To test settings, leave the <i>New Boot Defaults</i> box unchecked and click 'Update'.</li>\
+        <li>Once you have settings you'd like to keep, check the box and click 'Update' to write the settings as the new boot defaults.</li>\
+        <li>If you want to change wifi settings or the device name, you must use the 'Reset All' command.</li>\
+        <li>See the <a href=\"https://github.com/Resinchem/ESP-Parking-Assistant/wiki/05-Using-the-Web-Interface\" target=\"_blank\" rel=\"noopener noreferrer\">Github wiki</a> for more information on setting these values for your situation.</li>\
+      </ul>\
+      <form method=\"post\" enctype=\"application/x-www-form-urlencoded\" action=\"/postform/\">\
+        <table>\
+        <tr>\
+        <td><label for=\"leds\">Number of Pixels (1-256):</label></td>\
+        <td><input type=\"number\" min=\"1\" max=\"256\" step=\"1\" name=\"leds\" value=\"";
+    mainPage += String(numLEDs);
+    mainPage += "\"></td></tr>\
+        <tr>\
+        <td><label for=\"activebrightness\">Active LED Brightness (0-255):</label></td>\
+        <td><input type=\"number\" min=\"0\" max=\"255\" step=\"1\" name=\"activebrightness\" value=\"";
+    mainPage += String(activeBrightness);
+    mainPage += "\"></td></tr>\
+        <tr>\
+        <td><label for=\"sleepbrightness\">Standby LED Brightness (0-255):</label></td>\
+        <td><input type=\"number\" min=\"0\" max=\"255\" step=\"1\" name=\"sleepbrightness\" value=\"";
+    mainPage += String(sleepBrightness);
+    mainPage += "\"> (set to zero to disable)</td>\
+        </tr>\
+        <td>LED Wiring Connection:</td>\
+        <td><input type=\"radio\" id=\"left\" name=\"rightledwiring\" value=\"0\"";
+        if (!rightLEDWiring) {
+          mainPage += " checked=\"checked\">";
+        } else {
+          mainPage += ">";
+        }
+    mainPage += "<label for=\"left\">Left Side</label>&nbsp;&nbsp;\
+        <input type=\"radio\" id=\"right\" name=\"rightledwiring\" value=\"1\"";
+        if (rightLEDWiring) {
+          mainPage += " checked=\"checked\">";
+        } else {
+          mainPage += ">";
+        }
+    mainPage += "<label for=\"right\">Right Side</label>&nbsp;&nbsp;\
+        </td></tr>\
+        </table><br>\
+        <b><u>LED Active Times</b></u>:<br>\
+        This indicates how long the LEDs remain active when going from a no-car to car-detected (park) state or from a car-detected to no-car (exit)s state.<br><br>\
+        <table>\
+        <tr>\
+        <td><label for=\"ledparktime\">Active Park Time (seconds - 300 max):</label></td>\
+        <td><input type=\"number\" min=\"0\" max=\"300\" step=\"1\" name=\"ledparktime\" value=\"";
+    mainPage += String(maxOperationTimePark);
+    mainPage += "\"></td>\
+        </tr>\
+        <tr>\
+        <td><label for=\"ledexittime\">Active Exit Time (seconds - 300 max):</label></td>\
+        <td><input type=\"number\" min=\"0\" max=\"300\" step=\"1\" name=\"ledexittime\" value=\"";
+    mainPage += String(maxOperationTimeExit);
+    mainPage += "\"></td>\
+        </tr>\
+        </table><br>\
+        <b><u>Parking Distances</u></b>:<br><br>\
+        <button type=\"button\" id=\"btncalibrate\"\
+          style=\"background-color:#04AA6D\; color:white; border-radius: 12px; font-size: 16px; height: 30px;\"\
+          onclick=\"location.href = './calibrate';\">Calibration Mode</button>&nbsp;- See real time sensor data<br><br>\
+        These values, in inches, specify when the LED strip wakes (Wake distance), when the countdown starts (Active distance), when the car is in the desired parked position (Parked distance) or when it has pulled too far forward and should back up (Backup distance).<br><br>\
+        If using inches, you may enter decimal values (e.g. 27.5\") and these will be converted to millimeters in the code.  Values should decrease from Wake through Backup... maximum value is 192 inches (4980 mm) and minimum value is 12 inches (305 mm).<br><br>\
+        <table>\
+        <tr>\
+        <td>Show distances in:</td>\
+        <td><input type=\"radio\" id=\"inches\" name=\"uom\" value=\"0\"";
+        if (!uomDistance) {
+          mainPage += " checked=\"checked\">";
+        } else {
+          mainPage += ">";
+        }
+    mainPage += "<label for=\"inches\">Inches</label>&nbsp;&nbsp;\
+        <input type=\"radio\" id=\"mm\" name=\"uom\" value=\"1\"";
+        if (uomDistance) {
+          mainPage += " checked=\"checked\">";
+        } else {
+          mainPage += ">";
+        }
+    mainPage += "<label for=\"mm\">Millimeters</label>&nbsp;&nbsp;\
+        (you must update settings to switch units)</td></tr>\
+        <tr>\
+        <td><label for=\"wakedistance\">Wake Distance:</label></td>";
+
+    if (uomDistance) {
+      mainPage += "<td><input type=\"number\" min=\"305\" max=\"4980\" step=\"1\" name=\"wakedistance\" value=\"";
+      mainPage += String(intWakeDistance);
+      mainPage += "\"> mm</td>";
+    } else {
+      mainPage += "<td><input type=\"number\" min=\"12\" max=\"192\" step=\"0.1\" name=\"wakedistance\" value=\"";
+      mainPage += String(intWakeDistance);
+      mainPage += "\"> inches</td>";
+    }
+
+    mainPage += "</tr>\
+        <tr>\
+        <td><label for=\"activedistance\">Active Distance:</label></td>";
+    if (uomDistance) {
+      mainPage += "<td><input type=\"number\" min=\"305\" max=\"4980\" step=\"1\" name=\"activedistance\" value=\"";
+      mainPage += String(intStartDistance);
+      mainPage += "\"> mm</td>";
+    } else {
+      mainPage += "<td><input type=\"number\" min=\"12\" max=\"192\" step=\"0.1\" name=\"activedistance\" value=\"";
+      mainPage += String(intStartDistance);
+      mainPage += "\"> inches</td>";
+    }
+
+    mainPage += "</tr>\
+        <tr>\
+        <td><label for=\"parkeddistance\">Parked Distance:</label></td>";
+    if (uomDistance) {
+      mainPage += "<td><input type=\"number\" min=\"305\" max=\"4980\" step=\"1\" name=\"parkeddistance\" value=\"";
+      mainPage += String(intParkDistance);
+      mainPage += "\"> mm</td>";
+    } else {
+      mainPage += "<td><input type=\"number\" min=\"12\" max=\"192\" step=\"0.1\" name=\"parkeddistance\" value=\"";
+      mainPage += String(intParkDistance);
+      mainPage += "\"> inches</td>";
+    }
+
+    mainPage += "</tr>\
+        <tr>\
+        <td><label for=\"backupistance\">Backup Distance:</label></td>";
+    if (uomDistance) {
+      mainPage += "<td><input type=\"number\" min=\"305\" max=\"4980\" step=\"1\" name=\"backupdistance\" value=\"";
+      mainPage += String(intBackupDistance);
+      mainPage += "\"> mm</td>";
+    } else {
+      mainPage += "<td><input type=\"number\" min=\"12\" max=\"192\" step=\"0.1\" name=\"backupdistance\" value=\"";
+      mainPage += String(intBackupDistance);
+      mainPage += "\"> inches</td>";
+    }
+    mainPage += "</tr>\
+        </table><br>\
+        <b><u>Sensor Settings</u></b>:<br>\
+        Please see the <a href=\"https://github.com/Resinchem/ESP-Parking-Assistant/wiki/05-Using-the-Web-Interface\" target=\"_blank\" rel=\"noopener noreferrer\">Github wiki</a> for more information. Improper settings may cause system to become non-functional!<br><br>\
+        <table border=\"0\">\
+        <tr>\
+        <td>No Car Debounce:</td>\
+        <td><input type=\"number\" min=\"0\" max=\"25\" step=\"1\" name=\"nocardebounce\" style=\"width: 50px\;\" value=\"";
+    mainPage += String(nocarDetectedCounterMax);
+    mainPage += "\"> (0-25) cycles</td></tr>\
+        </table><br>";
+    mainPage += "<i><u>ESP32-based Controllers Only</u></i>\
+        <table border=\"0\">\
+        <tr>\
+        <td><label for=\"usesidesensor\">Secondary Side Sensor:</label></td><td>";
+    //Secondary Side Sensor is only available on the ESP32
+    mainPage += "<label class=\"radio-inline\">\
+          <input type=\"radio\" name=\"usesidesensor\" value=\"1\"";
+    if (useSideSensor) {
+      mainPage += " checked=\"checked\"";
+    }
+    mainPage += ">Enabled\
+          </label><label class=\"radio-inline\">\
+          <input type=\"radio\" name=\"usesidesensor\" value=\"0\"";
+    if (!useSideSensor) {
+      mainPage += " checked=\"checked\"";
+    }
+    mainPage += ">Disabled</label>";
+    if (!useSideSensor) {
+      mainPage += " <i>(enable and 'Update' settings to see additional fields)</i></td><tr>";
+    } else {
+      mainPage += "</td></tr>\
+            <tr>\
+            <td><label for=\"sidesensorpos\">Side Sensor Position:</label></td>\
+            <td><label class=\"radio-inline\">\
+            <input type=\"radio\" name=\"sidesensorpos\" value=\"1\"";
+        if (sideSensorPos == 1) {
+          mainPage += " checked=\"checked\"";
+        }
+        mainPage += ">Left Side\
+            </label><label class=\"radio-inline\">\
+            <input type=\"radio\" name=\"sidesensorpos\" value=\"2\"";
+        if (sideSensorPos == 2) {
+          mainPage += " checked=\"checked\"";
+        }
+        mainPage += ">Right Side\
+            </label></td></tr></table><br>";
+      mainPage += "<i>Due to sensor range, side sensor distance values must be between 2 inches (50mm) and 48 inches (1220mm).</i>";
+
+      mainPage += "<table border=\"0\">";
+      mainPage += "<tr>\
+            <td><label for=\"leftdistance\">Left Distance:</label></td>";
+
+      if (uomDistance) {
+        mainPage += "<td><input type=\"number\" min=\"50\" max=\"1220\" step=\"1\" name=\"leftdistance\" value=\"";
+        mainPage += String(intLeftDistance);
+        mainPage += "\"> mm</td>";
+      } else {
+        mainPage += "<td><input type=\"number\" min=\"2\" max=\"48\" step=\"0.1\" name=\"leftdistance\" value=\"";
+        mainPage += String(intLeftDistance);
+        mainPage += "\"> inches</td>";
+      }
+
+      mainPage += "</tr>\
+            <tr>\
+            <td><label for=\"rightdistance\">Right Distance:</label></td>";
+
+      if (uomDistance) {
+        mainPage += "<td><input type=\"number\" min=\"50\" max=\"1220\" step=\"1\" name=\"rightdistance\" value=\"";
+        mainPage += String(intRightDistance);
+        mainPage += "\"> mm</td>";
+      } else {
+        mainPage += "<td><input type=\"number\" min=\"2\" max=\"48\" step=\"0.1\" name=\"rightdistance\" value=\"";
+        mainPage += String(intRightDistance);
+        mainPage += "\"> inches</td>";
+      }
+      mainPage += "</tr></table><br>";
+    }
+    mainPage += "<b><u>LED Colors</u></b>:<br>\
+        <table>\
+        <tr>\
+        <td><label for=\"colorstandby\">Standby Color:</label></td>\
+        <td><select name=\"colorstandby\">";
+    for (int i = 0; i < numberOfColors; i++) {
+      mainPage += "<option value=\"" + String(i) + "\"";
+      if (webColorStandby == i) {
+        mainPage += " selected";
+      }
+      mainPage += ">" + WebColors[i] + "</option>";
+    }
+    mainPage += "</select></td></tr>\
+        <tr>\
+        <td><label for=\"colorwake\">Wake Color:</label></td>\
+        <td><select name=\"colorwake\">";
+    for (int i = 0; i < numberOfColors; i++) {
+      mainPage += "<option value=\"" + String(i) + "\"";
+      if (webColorWake == i) {
+        mainPage += " selected";
+      }
+      mainPage += ">" + WebColors[i] + "</option>";
+    }
+    mainPage += "</select></td></tr>\
+        <tr>\
+        <td><label for=\"coloractive\">Active Color:</label></td>\
+        <td><select name=\"coloractive\">";
+    for (int i = 0; i < numberOfColors; i++) {
+      mainPage += "<option value=\"" + String(i) + "\"";
+      if (webColorActive == i) {
+        mainPage += " selected";
+      }
+      mainPage += ">" + WebColors[i] + "</option>";
+    }
+    mainPage += "</select></td></tr>\
+        <tr>\
+        <td><label for=\"colorparked\">Parked Color:</label></td>\
+        <td><select name=\"colorparked\">";
+    for (int i = 0; i < numberOfColors; i++) {
+      mainPage += "<option value=\"" + String(i) + "\"";
+      if (webColorParked == i) {
+        mainPage += " selected";
+      }
+      mainPage += ">" + WebColors[i] + "</option>";
+    }
+    mainPage += "</select></td></tr>\
+        <tr>\
+        <td><label for=\"colorbackup\">Backup Color:</label></td>\
+        <td><select name=\"colorbackup\">";
+    for (int i = 0; i < numberOfColors; i++) {
+      mainPage += "<option value=\"" + String(i) + "\"";
+      if (webColorBackup == i) {
+        mainPage += " selected";
+      }
+      mainPage += ">" + WebColors[i] + "</option>";
+    }
+    mainPage += "</select></td></tr>\
+        </table><br>\
+        <b><u>LED Effects</u></b>:<br>\
+        <table>\
+        <tr>\
+        <td><label for=\"ledeffect\">LED Effect:</label></td>\
+        <td><select name=\"ledeffect\">";
+    for (int i = 0; i < numberOfEffects; i++) {
+      mainPage += "<option value=\"" + Effects[i] + "\"";
+      if (ledEffect_m1 == Effects[i]) {
+        mainPage += " selected";
+      }
+      mainPage += ">" + Effects[i] + "</option>";
+    }
+    mainPage += "</select></td></tr>\
+        </table><br>\
+        <b><u>MQTT Settings</u></b>:<br>\
+        <table border=\"0\">\
+        <tr>\
+        <td>MQTT Broker IP:</td>\
+        <td><input type=\"number\" min=\"0\" max=\"255\" step=\"1\" name=\"mqtt_addr_1\" style=\"width: 50px\;\" value=\"";
+    mainPage += String(mqttAddr_1);
+    mainPage += "\">.\
+        <input type=\"number\" min=\"0\" max=\"255\" step=\"1\" name=\"mqtt_addr_2\" style=\"width: 50px\;\" value=\"";
+    mainPage += String(mqttAddr_2);
+    mainPage += "\">.\
+        <input type=\"number\" min=\"0\" max=\"255\" step=\"1\" name=\"mqtt_addr_3\" style=\"width: 50px\;\" value=\"";
+    mainPage += String(mqttAddr_3);
+    mainPage += "\">.\
+        <input type=\"number\" min=\"0\" max=\"255\" step=\"1\" name=\"mqtt_addr_4\" style=\"width: 50px\;\" value=\"";
+    mainPage += String(mqttAddr_4);
+    mainPage += "\"> (set to 0.0.0.0 to disable MQTT)</td></tr>\
+        <tr>\
+        <td>MQTT Broker Port:</td>\
+        <td><input type=\"number\" min=\"0\" max=\"65535\" step=\"1\" name=\"mqtt_port\" style=\"width: 80px\;\" value=\"";
+    mainPage += String(mqttPort);
+    mainPage += "\"></td></tr>\
+        <tr>\
+        <td>MQTT Username:</td>\
+        <td><input type=\"text\" name=\"mqtt_user\" maxlength=\"64\" value=\"";
+    mainPage += mqttUser;
+    mainPage += "\"></td></tr>\
+        <tr>\
+        <td>MQTT Password:</td>\
+        <td><input type=\"password\" name=\"mqtt_pw\" maxlength=\"64\" value=\"";
+    mainPage += mqttPW;
+    mainPage += "\"></td></tr>\
+        <tr>\
+        <td>MQTT Telemetry Period (seconds):</td>\
+        <td><input type=\"number\" min=\"0\" max=\"600\" step=\"1\" name=\"mqtt_tele_period\" style=\"width: 50px\;\" value=\"";
+    mainPage += String(mqttTelePeriod);
+    mainPage += "\"></td></tr>\
+        <tr>\
+        <td>MQTT Topic (Subscribe):</td>\
+        <td><input type=\"text\" name=\"mqtt_topic_sub\" maxlength=\"64\" value=\"";
+    mainPage += mqttTopicSub;
+    mainPage += "\"></td></tr>\
+        <tr>\
+        <td>MQTT Topic (Publish):</td>\
+        <td><input type=\"text\" name=\"mqtt_topic_pub\" maxlength=\"64\" value=\"";
+    mainPage += mqttTopicPub;
+    mainPage += "\"></td></tr>\
+        </table><br>\
+        <input type=\"submit\" value=\"Update Settings\">&nbsp;&nbsp;\
+        <input type=\"checkbox\" id=\"saveconfig\" name=\"saveconfig\" value=\"1\"><label for=\"saveconfig\">Save as New Boot Defaults</label>\
+        <br><br>\
+        <button type=\"button\" id=\"btnreset\"\
+          style=\"background-color:#d40000\; color:white; border-radius: 12px; font-size: 16px; height: 30px;\"\
+          onclick=\"location.href = './reset';\">Reset All Settings</button>&nbsp;- Erases ALL settings and restarts controller<br><br>\
+        <button type=\"button\" id=\"btnreboot\"\
+          style=\"background-color:#0000d4\; color:white; border-radius: 12px; font-size: 16px; height: 30px;\"\
+          onclick=\"location.href = './reboot';\">Reboot Controller</button>&nbsp;- Restarts controller with current settings<br><br>\
+        <button type=\"button\" id=\"btnfirmware\"\
+          style=\"background-color:#008000\; color:white; border-radius: 12px; font-size: 16px; height: 30px;\"\
+          onclick=\"location.href = './firmware';\">Firmware Update</button>&nbsp;- Update firmware via web browser<br><br>\
+      </form>\
+    </body>\
+    </html>";
+
+    mainPage.replace("VAR_APP_NAME", APPNAME);
+    mainPage.replace("VAR_DEVICE_NAME", deviceName);
+    mainPage.replace("VAR_CURRENT_VER", VERSION);
+  }
+  server.send(200, "text/html", mainPage);
+}
+
+// Handler for onboarding form submission
+void handleOnboard() {
+  if (server.hasArg("ssid")) {
+    wifiSSID = server.arg("ssid");
+  }
+  if (server.hasArg("wifipw")) {
+    wifiPW = server.arg("wifipw");
+  }
+  if (server.hasArg("devicename")) {
+    deviceName = server.arg("devicename");
+    deviceName.toLowerCase(); // Ensure device name is lowercase
+  }
+  if (server.hasArg("maxmilliamps")) {
+    milliamps = server.arg("maxmilliamps").toInt();
+    if (milliamps < 2000 || milliamps > 10000) {
+      milliamps = 5000; // Default if out of range
+    }
+  }
+  // Set numLEDs to the fixed matrix size during onboarding
+  numLEDs = NUM_LEDS_TOTAL;
+
+  // Attempt to connect to WiFi and save config
+  WiFi.begin(wifiSSID.c_str(), wifiPW.c_str());
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.print(".");
+    #endif
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    onboarding = false;
+    writeConfigFile(true); // Save config and reboot
+  } else {
+    // Still in onboarding mode, show error
+    String response = "<html><body><h1>WiFi Connection Failed!</h1><p>Could not connect to WiFi network. Please check your SSID and password and try again.</p><p><a href=\"/\">Go Back</a></p></body></html>";
+    server.send(200, "text/html", response);
+  }
+}
+
+// Handler for settings form submission
+void handlePostForm() {
+  if (server.hasArg("leds")) {
+    numLEDs = server.arg("leds").toInt();
+    if (numLEDs < 1 || numLEDs > NUM_LEDS_TOTAL) { // Constrain to matrix size
+      numLEDs = NUM_LEDS_TOTAL;
+    }
+  }
+  if (server.hasArg("activebrightness")) {
+    activeBrightness = server.arg("activebrightness").toInt();
+  }
+  if (server.hasArg("sleepbrightness")) {
+    sleepBrightness = server.arg("sleepbrightness").toInt();
+  }
+  if (server.hasArg("rightledwiring")) {
+    rightLEDWiring = (server.arg("rightledwiring").toInt() == 1);
+  }
+  if (server.hasArg("ledparktime")) {
+    maxOperationTimePark = server.arg("ledparktime").toInt();
+  }
+  if (server.hasArg("ledexittime")) {
+    maxOperationTimeExit = server.arg("ledexittime").toInt();
+  }
+  if (server.hasArg("uom")) {
+    uomDistance = server.arg("uom").toInt();
+  }
+  if (server.hasArg("wakedistance")) {
+    wakeDistance = (uomDistance == 0) ? round(server.arg("wakedistance").toFloat() * 25.4) : server.arg("wakedistance").toInt();
+  }
+  if (server.hasArg("activedistance")) {
+    startDistance = (uomDistance == 0) ? round(server.arg("activedistance").toFloat() * 25.4) : server.arg("activedistance").toInt();
+  }
+  if (server.hasArg("parkeddistance")) {
+    parkDistance = (uomDistance == 0) ? round(server.arg("parkeddistance").toFloat() * 25.4) : server.arg("parkeddistance").toInt();
+  }
+  if (server.hasArg("backupdistance")) {
+    backupDistance = (uomDistance == 0) ? round(server.arg("backupdistance").toFloat() * 25.4) : server.arg("backupdistance").toInt();
+  }
+  if (server.hasArg("nocardebounce")) {
+    nocarDetectedCounterMax = server.arg("nocardebounce").toInt();
+  }
+  if (useSideSensor) { // Only read if side sensor is enabled
+    if (server.hasArg("leftdistance")) {
+      leftDistance = (uomDistance == 0) ? round(server.arg("leftdistance").toFloat() * 25.4) : server.arg("leftdistance").toInt();
+    }
+    if (server.hasArg("rightdistance")) {
+      rightDistance = (uomDistance == 0) ? round(server.arg("rightdistance").toFloat() * 25.4) : server.arg("rightdistance").toInt();
+    }
+    if (server.hasArg("sidesensorpos")) {
+      sideSensorPos = server.arg("sidesensorpos").toInt();
+    }
+  } else { // If disabled, reset side sensor related values
+    leftDistance = 0;
+    rightDistance = 0;
+    sideSensorPos = 0;
+  }
+
+  if (server.hasArg("colorstandby")) {
+    webColorStandby = server.arg("colorstandby").toInt();
+    ledColorStandby = ColorCodes[webColorStandby];
+  }
+  if (server.hasArg("colorwake")) {
+    webColorWake = server.arg("colorwake").toInt();
+    ledColorWake = ColorCodes[webColorWake];
+  }
+  if (server.hasArg("coloractive")) {
+    webColorActive = server.arg("coloractive").toInt();
+    ledColorActive = ColorCodes[webColorActive];
+  }
+  if (server.hasArg("colorparked")) {
+    webColorParked = server.arg("colorparked").toInt();
+    ledColorParked = ColorCodes[webColorParked];
+  }
+  if (server.hasArg("colorbackup")) {
+    webColorBackup = server.arg("colorbackup").toInt();
+    ledColorBackup = ColorCodes[webColorBackup];
+  }
+  if (server.hasArg("ledeffect")) {
+    ledEffect_m1 = server.arg("ledeffect");
+  }
+  if (server.hasArg("mqtt_addr_1")) {
+    mqttAddr_1 = server.arg("mqtt_addr_1").toInt();
+    mqttAddr_2 = server.arg("mqtt_addr_2").toInt();
+    mqttAddr_3 = server.arg("mqtt_addr_3").toInt();
+    mqttAddr_4 = server.arg("mqtt_addr_4").toInt();
+  }
+  if (server.hasArg("mqtt_port")) {
+    mqttPort = server.arg("mqtt_port").toInt();
+  }
+  if (server.hasArg("mqtt_tele_period")) {
+    mqttTelePeriod = server.arg("mqtt_tele_period").toInt();
+  }
+  if (server.hasArg("mqtt_user")) {
+    mqttUser = server.arg("mqtt_user");
+  }
+  if (server.hasArg("mqtt_pw")) {
+    mqttPW = server.arg("mqtt_pw");
+  }
+  if (server.hasArg("mqtt_topic_sub")) {
+    mqttTopicSub = server.arg("mqtt_topic_sub");
+  }
+  if (server.hasArg("mqtt_topic_pub")) {
+    mqttTopicPub = server.arg("mqtt_topic_pub");
+  }
+
+  // Check if MQTT should be enabled/disabled
+  if ((mqttAddr_1 == 0) && (mqttAddr_2 == 0) && (mqttAddr_3 == 0) && (mqttAddr_4 == 0)) {
+    mqttEnabled = false;
+    mqttConnected = false;
+  } else {
+    mqttEnabled = true;
+  }
+
+  // Update LED matrix settings
+  matrix.setBrightness(activeBrightness);
+
+  if (server.hasArg("saveconfig") && server.arg("saveconfig").toInt() == 1) {
+    writeConfigFile(true); // Save and reboot
+  } else {
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "Settings Updated (not saved to boot defaults)");
+  }
+}
+
+// Handler for reset all settings
+void handleReset() {
+  LittleFS.format(); // Erase all files
+  String response = "<html><body><h1>Settings Reset!</h1><p>All settings have been erased. The device will now reboot and enter onboarding mode.</p></body></html>";
+  server.send(200, "text/html", response);
+  delay(2000);
+  ESP.restart();
+}
+
+// Handler for reboot
+void handleReboot() {
+  String response = "<html><body><h1>Rebooting...</h1><p>The device is restarting now.</p></body></html>";
+  server.send(200, "text/html", response);
+  delay(2000);
+  ESP.restart();
+}
+
+// Handler for firmware update page
+void handleFirmware() {
+  String firmwarePage = "<!DOCTYPE html>\
+  <html>\
+  <head>\
+    <title>Firmware Update</title>\
+    <style>\
+      body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
+    </style>\
+  </head>\
+  <body>\
+    <h1>Firmware Update</h1>\
+    <form method=\"POST\" action=\"/update\" enctype=\"multipart/form-data\">\
+      <input type=\"file\" name=\"firmware\">\
+      <input type=\"submit\" value=\"Update Firmware\">\
+    </form>\
+    <br><br>\
+    <a href=\"/\">Back to Settings</a>\
+  </body>\
+  </html>";
+  server.send(200, "text/html", firmwarePage);
+}
+
+// Handler for firmware update upload
+void handleUpdate() {
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain", (Update.hasError() ? "FAIL" : "OK"));
+  ESP.restart();
+}
+
+// Handler for calibration mode
+void handleCalibrate() {
+  String calibratePage = "<html><head>";
+  calibratePage += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">";
+  calibratePage += "<meta http-equiv=\"refresh\" content=\"1\">"; // Auto-refresh every 1 second
+  calibratePage += "<title>Calibration Mode</title>\
+    <style>\
+      body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
+    </style>\
+  </head>\
+  <body>\
+    <h1>Calibration Mode</h1>\
+    <p>Front Distance: " + String(intervalDistance) + " mm</p>"; // Use global intervalDistance
+  if (useSideSensor) {
+    calibratePage += "<p>Side Distance: " + String(side_sensor.readRangeSingleMillimeters()) + " mm</p>";
+  }
+  calibratePage += "<p>TF-Mini Signal Strength: " + String(currentFlux) + "</p>"; // Use global currentFlux
+  calibratePage += "<p>TF-Mini Temperature: " + String(currentTemp) + " C</p>"; // Use global currentTemp
+  calibratePage += "<p><a href=\"/\">Back to Settings</a></p>\
+  </body>\
+  </html>";
+  server.send(200, "text/html", calibratePage);
+}
+
+//=======================================
+// MQTT Callback Function
+//=======================================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+    Serial.print("Message arrived [");
+    Serial.print(topic);
+    Serial.print("] ");
+    for (int i = 0; i < length; i++) {
+      Serial.print((char)payload[i]);
+    }
+    Serial.println();
+  #endif
+
+  // Handle incoming MQTT messages here if needed (e.g., to change settings via MQTT)
+  // Example: if (String(topic) == mqttTopicSub + "/set/brightness") { ... }
+}
+
+//=======================================
+// MQTT Reconnect Function
+//=======================================
+void reconnectMQTT() {
+  if (!mqttEnabled) return; // Don't try to reconnect if MQTT is disabled
+
+  while (!client.connected()) {
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.print("Attempting MQTT connection...");
+    #endif
+    // Attempt to connect
+    if (client.connect(mqttClient.c_str(), mqttUser.c_str(), mqttPW.c_str())) {
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.println("connected");
+      #endif
+      mqttConnected = true;
+      // Subscribe
+      client.subscribe(mqttTopicSub.c_str());
+    } else {
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.print("failed, rc=");
+        Serial.print(client.state());
+        Serial.println(" try again in 5 seconds");
+      #endif
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
+
+//=======================================
+// Update OLED Display
+//=======================================
+void updateOledDisplay() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr); // Choose a font
+
+  u8g2.setCursor(0, 10);
+  u8g2.print("Front: ");
+  u8g2.print(intervalDistance); // Use global intervalDistance
+  u8g2.print("mm");
+
+  if (useSideSensor) {
+    u8g2.setCursor(0, 25);
+    u8g2.print("Side: ");
+    u8g2.print(side_sensor.readRangeSingleMillimeters());
+    u8g2.print("mm");
+  }
+
+  u8g2.setCursor(0, 40);
+  u8g2.print("Status: ");
+  if (isAwake) {
+    u8g2.print("ACTIVE");
+  } else if (carDetected) {
+    u8g2.print("PARKED");
+  } else {
+    u8g2.print("SLEEP");
+  }
+
+  u8g2.setCursor(0, 55);
+  u8g2.print("IP: ");
+  u8g2.print(baseIP);
+
+  u8g2.sendBuffer();
+}
+
+//=======================================
+// LED Matrix Display Functions
+//=======================================
+
+// Clears the entire matrix
+void clearMatrix() {
+  matrix.fillScreen(matrix.Color(0, 0, 0)); // Black
+  matrix.show();
+}
+
+// Draws a guide for side centering
+void drawCenteringGuide(int distance) {
+    // Clear the centering area (left 8 columns)
+    for (int x = 0; x < 8; x++) {
+        for (int y = 0; y < MATRIX_HEIGHT; y++) {
+            matrix.drawPixel(x, y, matrix.Color(0, 0, 0)); // Clear to black
+        }
+    }
+
+    // NOTE: SIDE_IDEAL_DISTANCE and SIDE_CENTERED_TOLERANCE are not defined in this code.
+    // You will need to define these constants in your sketch's global variables section
+    // based on your desired side parking distances. For example:
+    // #define SIDE_IDEAL_DISTANCE 300 // in mm, e.g., 300mm = ~12 inches
+    // #define SIDE_CENTERED_TOLERANCE 50 // in mm, e.g., 50mm = ~2 inches
+
+    // Placeholder values for compilation if not defined elsewhere
+    #ifndef SIDE_IDEAL_DISTANCE
+    #define SIDE_IDEAL_DISTANCE 300 // Default to 300mm if not defined
+    #endif
+    #ifndef SIDE_CENTERED_TOLERANCE
+    #define SIDE_CENTERED_TOLERANCE 50 // Default to 50mm if not defined
+    #endif
+
+    int center_offset = distance - (uomDistance == 0 ? round(SIDE_IDEAL_DISTANCE / 25.4) : SIDE_IDEAL_DISTANCE); // Convert to inches if needed
+    int tolerance = (uomDistance == 0 ? round(SIDE_CENTERED_TOLERANCE / 25.4) : SIDE_CENTERED_TOLERANCE); // Convert to inches if needed
+
+    // Draw centering indicator
+    if (abs(center_offset) <= tolerance) {
+        // Centered: Green square
+        matrix.fillRect(2, 2, 4, 4, matrix.Color(0, 255, 0)); // Green
+    } else if (center_offset > tolerance) {
+        // Too far left (move right): Yellow arrow pointing right
+        matrix.fillScreen(matrix.Color(0,0,0)); // Clear entire screen
+        matrix.drawTriangle(10, 2, 20, 4, 10, 6, matrix.Color(255, 255, 0)); // Yellow arrow pointing right
+    } else { // center_offset < -tolerance
+        // Too far right (move left): Yellow arrow pointing left
+        matrix.fillScreen(matrix.Color(0,0,0)); // Clear entire screen
+        matrix.drawTriangle(22, 2, 12, 4, 22, 6, matrix.Color(255, 255, 0)); // Yellow arrow pointing left
+    }
+    matrix.show();
+}
+
+// Draws a progress bar for forward distance
+void drawForwardGuide(int distance) {
+    // Clear the forward guide area (right 24 columns)
+    for (int x = 8; x < MATRIX_WIDTH; x++) {
+        for (int y = 0; y < MATRIX_HEIGHT; y++) {
+            matrix.drawPixel(x, y, matrix.Color(0, 0, 0)); // Clear to black
+        }
+    }
+
+    int mapped_distance = map(distance, wakeDistance, parkDistance, 0, MATRIX_WIDTH - 8); // Map to 24 columns
+    mapped_distance = constrain(mapped_distance, 0, MATRIX_WIDTH - 8);
+
+    uint32_t color;
+    if (distance > startDistance) { // Far away (blue)
+        color = ledColorWake; // Blue
+    } else if (distance > parkDistance) { // Getting closer (yellow)
+        color = ledColorActive; // Yellow
+    } else { // Optimal parking (green)
+        color = ledColorParked; // Red
+    }
+
+    // Draw the progress bar
+    matrix.fillRect(8, 0, mapped_distance, MATRIX_HEIGHT, color);
+    matrix.show();
+}
+
+// Shows a full-screen stop alert
+void showStopAlert() {
+  matrix.fillScreen(ledColorBackup); // Red
+  matrix.show();
+  digitalWrite(ONBOARD_LED, HIGH); // Blink onboard LED
+  delay(200);
+  matrix.fillScreen(matrix.Color(0, 0, 0)); // Black
+  matrix.show();
+  digitalWrite(ONBOARD_LED, LOW);
+  delay(200);
+}
+
+// Shows "OK" message when parked
+void showParkedMessage() {
+  matrix.clear();
+  matrix.setFont(NULL); // Use default Adafruit GFX font
+  matrix.setTextColor(ledColorParked); // Green
+  // Center "OK" text on the matrix
+  int16_t x, y;
+  uint16_t w, h;
+  matrix.getTextBounds("OK", 0, 0, &x, &y, &w, &h);
+  matrix.setCursor((MATRIX_WIDTH - w) / 2, (MATRIX_HEIGHT + h) / 2 - 1); // Adjust for font baseline
+  matrix.print("OK");
+  matrix.show();
+}
+
+// Shows temperature and humidity on standby
+void showStandbyDisplay() {
+  matrix.clear();
+  matrix.setFont(NULL); // Use default Adafruit GFX font
+  matrix.setTextColor(ledColorStandby); // Blue
+
+  // Display temperature
+  matrix.setCursor(0, 7); // Top left
+  matrix.print(String(currentTemp) + "C"); // Use global currentTemp
+
+  // Display humidity (placeholder, as TF-Mini doesn't provide humidity)
+  matrix.setCursor(MATRIX_WIDTH - 18, 7); // Top right
+  matrix.print("NA%"); // No humidity sensor in this setup
+
+  matrix.show();
+}
+
+
+//=======================================
+// Main Setup Function
+//=======================================
+void setup() {
+  // Initialize Serial for debugging
+  #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+    Serial.begin(115200);
+    Serial.println("\n" APPNAME " Booting Up " VERSION);
+  #endif
+
+  // Initialize onboard LED (for status/blink)
+  pinMode(ONBOARD_LED, OUTPUT);
+  digitalWrite(ONBOARD_LED, HIGH); // Turn on during boot
+
+  // Initialize LittleFS
+  if (!LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED)) {
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println("LittleFS Mount Failed, formatting...");
+    #endif
+    LittleFS.format();
+    LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED);
+  }
+
+  // Read configuration from LittleFS
+  readConfigFile();
+
+  // Define effects and colors
+  defineEffects();
+  defineColors();
+
+  // Initialize OLED
+  Wire.begin(OLED_SDA, OLED_SCL); // Initialize I2C for OLED
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr); // Set font for splash screen
+  u8g2.drawStr(0, 10, APPNAME);
+  u8g2.drawStr(0, 25, "Heltec V3");
+  u8g2.drawStr(0, 40, "Starting...");
+  u8g2.sendBuffer();
+
+  // Initialize LED Matrix
+  matrix.begin();
+  matrix.setBrightness(activeBrightness);
+  matrix.clear();
+  matrix.show();
+
+  // Initialize TF-Mini Plus LiDAR
+  Serial2.begin(115200, SERIAL_8N1, ESP32_RX_PIN, ESP32_TX_PIN); // Use Serial2 for TF-Mini
+  tfmini.begin(&Serial2); // Pass Serial2 object to TF-Mini library
+  // Corrected: Use BAUD_115200 directly (now defined above)
+  if (tfmini.sendCommand(SET_BAUD_RATE, BAUD_115200)) { // Ensure TF-Mini is at 115200 baud
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println("TF-Mini baud set to 115200");
+    #endif
+  } else {
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println("Failed to set TF-Mini baud");
+    #endif
+  }
+  // Corrected: Use direct constants for sendCommand (now defined above)
+  tfmini.sendCommand(SET_MEASURE_MODE, MEASURE_MODE_STANDARD); // Standard measurement mode
+  tfmini.sendCommand(SET_FRAME_RATE, FRAME_RATE_250); // Set frame rate to 250Hz for faster reads
+  tfMiniEnabled = true;
+
+  // Initialize VL53L0X side sensor (if enabled)
+  if (useSideSensor) {
+    Wire.begin(); // Ensure Wire is initialized for VL53L0X (already done for OLED, but good to ensure)
+    side_sensor.setAddress(0x29); // Default I2C address for VL53L0X
+    if (!side_sensor.init()) {
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.println("Failed to initialize VL53L0X sensor! Check wiring.");
+      #endif
+      useSideSensor = false; // Disable if not found
+    } else {
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.println("VL53L0X sensor initialized.");
+      #endif
+      side_sensor.setTimeout(500); // Set timeout for readings
+      // Lower the VCSEL period for more range (optional, depends on environment)
+      // Corrected function name from setVcselPeriod to setVcselPulsePeriod
+      side_sensor.setVcselPulsePeriod(VL53L0X::VcselPeriodPreRange, 18);
+    }
+  }
+
+  // Get MAC address for unique ID
+  WiFi.macAddress(macAddr);
+  for (byte i = 0; i < 6; i++) {
+    strMacAddr += String(macAddr[i] < 16 ? "0" : "");
+    strMacAddr += String(macAddr[i], HEX);
+    if (i < 5) strMacAddr += ":";
+  }
+  strMacAddr.toUpperCase();
+  sprintf(devUniqueID, "%s_%02X%02X%02X%02X%02X%02X", uidPrefix, macAddr[0], macAddr[1], macAddr[2], macAddr[3], macAddr[4], macAddr[5]);
+
+  // Set up WiFi (AP or Station)
+  if (WIFIMODE == 0 || onboarding) { // Soft AP only or during onboarding
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(wifiHostName.c_str());
+    baseIP = WiFi.softAPIP().toString();
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.print("Access Point IP: ");
+      Serial.println(baseIP);
+    #endif
+  } else { // Try to connect to existing WiFi
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(wifiHostName.c_str());
+    WiFi.begin(wifiSSID.c_str(), wifiPW.c_str());
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.print("Connecting to WiFi");
+    #endif
+    int connectAttempts = 0;
+    while (WiFi.status() != WL_CONNECTED && connectAttempts < 30) {
+      delay(500);
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.print(".");
+      #endif
+      connectAttempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      baseIP = WiFi.localIP().toString();
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.println("\nWiFi Connected!");
+        Serial.print("IP Address: ");
+        Serial.println(baseIP);
+      #endif
+      // If WIFIMODE is 2, also enable SoftAP for local access
+      if (WIFIMODE == 2) {
+        WiFi.softAP(wifiHostName.c_str());
+      }
+    } else {
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.println("\nFailed to connect to WiFi. Entering AP mode.");
+      #endif
+      onboarding = true; // Force onboarding if connection fails
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(wifiHostName.c_str());
+      baseIP = WiFi.softAPIP().toString();
+    }
+  }
+
+  // Setup Web Server Handlers
+  server.on("/", handleRoot);
+  server.on("/onboard", HTTP_POST, handleOnboard);
+  server.on("/postform/", HTTP_POST, handlePostForm);
+  server.on("/reset", handleReset);
+  server.on("/reboot", handleReboot);
+  server.on("/firmware", handleFirmware);
+  server.on("/calibrate", handleCalibrate); // Calibration page
+
+  server.on("/update", HTTP_POST, [](){
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/plain", (Update.hasError() ? "FAIL" : "OK"));
+    ESP.restart();
+  }, [](){
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.printf("Update: %s\n", upload.filename.c_str());
+      #endif
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) { //true to set the size to the current progress
+        #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+          Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+        #endif
+      } else {
+        Update.printError(Serial);
+      }
+    }
+  });
+
+  server.begin();
+  #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+    Serial.println("Web Server Started.");
+  #endif
+
+  // Setup ArduinoOTA
+  ArduinoOTA.setHostname(otaHostName.c_str());
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else { // U_SPIFFS
+      type = "filesystem";
+      LittleFS.end(); // Unmount LittleFS for filesystem update
+    }
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println("Start updating " + type);
+    #endif
+  });
+  ArduinoOTA.onEnd([]() {
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println("\nEnd");
+    #endif
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    #endif
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    #endif
+  });
+  ArduinoOTA.begin();
+  #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+    Serial.println("OTA Ready.");
+  #endif
+
+  // Setup MQTT
+  if (mqttEnabled) {
+    IPAddress mqttServerIP(mqttAddr_1, mqttAddr_2, mqttAddr_3, mqttAddr_4);
+    client.setServer(mqttServerIP, mqttPort);
+    client.setCallback(mqttCallback);
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println("MQTT Client configured.");
+    #endif
+  }
+
+  digitalWrite(ONBOARD_LED, LOW); // Turn off onboard LED after boot
+  coldStart = false; // Indicate that boot sequence is complete
+}
+
+//=======================================
+// Main Loop Function
+//=======================================
+void loop() {
+  server.handleClient(); // Handle web server requests
+  ArduinoOTA.handle();   // Handle OTA updates
+
+  if (mqttEnabled) {
+    if (!client.connected()) {
+      reconnectMQTT();
+    }
+    client.loop(); // Keep MQTT client alive
+  }
+
+  // TF-Mini Plus LiDAR data acquisition
+  int16_t dist, flux, temp;
+  if (tfmini.getData(dist, flux, temp)) { // Get data from TF-Mini
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.printf("TF-Mini: Dist=%dmm, Flux=%d, Temp=%dC\n", dist, flux, temp);
+    #endif
+    if (dist > 0 && dist < 12000 && flux > 100) { // Basic validation
+      intervalDistance = dist;
+      currentFlux = flux; // Store flux globally
+      currentTemp = temp; // Store temp globally
+      outOfRangeCounter = 0;
+    } else {
+      outOfRangeCounter++;
+      if (outOfRangeCounter > 5) { // If out of range for a few readings, assume no car
+        intervalDistance = 9999; // Indicate no valid reading
+      }
+    }
+  } else {
+    tfmini.sendCommand(SOFT_RESET, 0); // Reset TF-Mini if data acquisition fails (now defined above)
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println("TF-Mini data error, attempting reset.");
+    #endif
+    intervalDistance = 9999; // Indicate no valid reading
+  }
+
+  // Determine car presence and state
+  if (intervalDistance < wakeDistance) {
+    carDetectedCounter++;
+    nocarDetectedCounter = 0; // Reset no car counter
+    if (carDetectedCounter >= carDetectedCounterMax) {
+      carDetected = true;
+      carDetectedCounter = carDetectedCounterMax; // Cap the counter
+    }
+  } else {
+    nocarDetectedCounter++;
+    carDetectedCounter = 0; // Reset car detected counter
+    if (nocarDetectedCounter >= nocarDetectedCounterMax) {
+      carDetected = false;
+      nocarDetectedCounter = nocarDetectedCounterMax; // Cap the counter
+    }
+  }
+
+  // Logic for LED Matrix and OLED display based on car state
+  if (carDetected) {
+    isAwake = true;
+    exitSleepTimerStarted = false; // Reset exit timer
+    if (!parkSleepTimerStarted) {
+      startTime = millis();
+      parkSleepTimerStarted = true;
+    }
+
+    if (intervalDistance <= backupDistance) {
+      showStopAlert(); // Flash red for backup
+    } else if (intervalDistance <= parkDistance) {
+      showParkedMessage(); // Show "OK"
+    } else if (intervalDistance <= startDistance) {
+      drawForwardGuide(intervalDistance); // Show progress bar (yellow/green)
+    } else { // Car is detected but still far (wake distance)
+      drawForwardGuide(intervalDistance); // Show progress bar (blue)
+    }
+
+    if (millis() - startTime > (maxOperationTimePark * 1000)) {
+      isAwake = false; // Go to sleep after max park time
+    }
+
+  } else { // No car detected
+    parkSleepTimerStarted = false; // Reset park timer
+    if (!exitSleepTimerStarted) {
+      startTime = millis();
+      exitSleepTimerStarted = true;
+    }
+
+    if (millis() - startTime > (maxOperationTimeExit * 1000)) {
+      isAwake = false; // Go to sleep after max exit time
+    }
+
+    if (isAwake) { // Still active after car exit
+      // Optionally show a "Goodbye" or "Clear" animation
+      matrix.clear();
+      matrix.setFont(NULL); // Use default Adafruit GFX font
+      matrix.setTextColor(matrix.Color(0, 255, 0));
+      int16_t x, y;
+      uint16_t w, h;
+      matrix.getTextBounds("CLEAR", 0, 0, &x, &y, &w, &h);
+      matrix.setCursor((MATRIX_WIDTH - w) / 2, (MATRIX_HEIGHT + h) / 2 - 1);
+      matrix.print("CLEAR");
+      matrix.show();
+    } else { // Fully asleep
+      showStandbyDisplay(); // Show temp/hum or default standby
+    }
+  }
+
+  // Update OLED display
+  updateOledDisplay();
+
+  delay(100); // Small delay for stability
+}
