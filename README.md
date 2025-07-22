@@ -1,4 +1,4 @@
-## An ESP8266/ESP32 and WS2812b LED Parking Assistant
+## A Heltec Wifi kit 32 (V3) and WS2812b LED Parking Assistant
 
 ![Four_Bars_ExtraSmall](https://user-images.githubusercontent.com/55962781/202794373-1cdfc5d2-508c-4eeb-9bc8-bf75e5dc39d9.jpg)
 
